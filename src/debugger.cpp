@@ -5,9 +5,11 @@
 #include "elf++.hh"
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <sys/personality.h>
@@ -15,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <vector>
 
 Debugger::Debugger (std::string program_name) : m_program_name (program_name)
 {
@@ -60,8 +63,7 @@ dwarf::line_table::iterator Debugger::get_line_entry_from_pc (uint64_t pc)
 
                 if (it == lt.end ())
                         throw std::out_of_range ("Cannot find line entry!");
-                
-                
+
                 return it;
         }
 }
@@ -161,9 +163,132 @@ void Debugger::step_out ()
 
         this->continue_execution ();
 
-        if (should_remove_breakpoint) 
+        if (should_remove_breakpoint)
                 this->remove_breakpoint (ret_addr);
+}
 
+void Debugger::print_source (const char *filename, int line, int delta)
+{
+        FILE *fp = fopen (filename, "r");
+
+        int current_line = 1;
+        int c;
+        while ((c = fgetc (fp)) != EOF) {
+                if (c == '\n')
+                        current_line++;
+
+                if (current_line == std::max (0, line - delta))
+                        break;
+        }
+
+        while ((c = fgetc (fp)) != EOF) {
+                if (c == '\n')
+                        current_line++;
+
+                if (current_line == line + delta + 1)
+                        break;
+
+                fputc (c, stdout);
+        }
+
+        fclose (fp);
+}
+
+void Debugger::step_in ()
+{
+        int line = this->get_line_entry_from_pc (this->get_offset_pc ())->line;
+
+        while (line == this->get_line_entry_from_pc (this->get_offset_pc ())->line)
+                this->single_step_instruction_with_breakpoint_check ();
+
+        auto line_entry = this->get_line_entry_from_pc (this->get_offset_pc ());
+
+        std::string path = line_entry->file->path;
+        line = line_entry->line;
+
+        this->print_source (path.c_str (), line, 10);
+}
+
+void Debugger::step_over ()
+{
+        auto func = this->get_function_from_pc (this->get_offset_pc ());
+
+        auto lo = dwarf::at_low_pc (func), hi = dwarf::at_high_pc (func);
+
+        auto line = this->get_line_entry_from_pc (lo);
+
+        auto current_line = get_line_entry_from_pc (get_offset_pc ());
+
+        std::vector<uint64_t> to_delete;
+
+        while (line->address < hi) {
+                auto load_address = offset_dwarf_address (line->address);
+
+                if (line->address == current_line->address) {
+                        line++;
+                        continue;
+                }
+
+                if (!this->has_breakpoint (load_address))
+                        to_delete.push_back (load_address);
+
+                set_breakpoint (load_address);
+                line++;
+        }
+
+        uint64_t ret_addr = this->read_register (REG_LR);
+
+        if (!this->has_breakpoint (ret_addr)) {
+                to_delete.push_back (ret_addr);
+        }
+
+        set_breakpoint (ret_addr);
+
+        this->continue_execution ();
+
+        for (uint64_t addr : to_delete)
+                remove_breakpoint (addr);
+}
+
+void Debugger::set_breakpoint_at_source_line (const std::string &file, int line)
+{
+        for (const auto &cu : m_dwarf.compilation_units ()) {
+                std::string filename = dwarf::at_name (cu.root ());
+
+                if (filename != file)
+                        continue;
+
+                const auto &lt = cu.get_line_table ();
+
+                for (auto &entry : lt) {
+                        if (entry.line != line)
+                                continue;
+
+                        set_breakpoint (offset_dwarf_address (entry.address));
+
+                        return;
+                }
+        }
+}
+
+void Debugger::set_breakpoint_at_function (const std::string &name)
+{
+        for (const auto &cu : m_dwarf.compilation_units ()) {
+                for (const auto &die : cu.root ()) {
+                        if (!die.has (dwarf::DW_AT::name))
+                                continue;
+
+                        if (dwarf::at_name (die) != name)
+                                continue;
+
+                        auto lo = dwarf::at_low_pc (die);
+                        auto line = get_line_entry_from_pc (lo);
+
+                        line++;
+
+                        set_breakpoint (line->address);
+                }
+        }
 }
 
 uint64_t Debugger::read_memory (uint64_t address)
@@ -179,6 +304,13 @@ void Debugger::write_memory (uint64_t address, uint64_t value)
 uint64_t Debugger::get_pc ()
 {
         return this->read_register (-1);
+}
+
+uint64_t Debugger::get_offset_pc ()
+{
+        uint64_t pc = this->get_pc ();
+
+        return this->offset_load_address (pc);
 }
 
 void Debugger::write_pc (uint64_t address)
@@ -264,6 +396,19 @@ void Debugger::initialize_load_address ()
 uint64_t Debugger::offset_load_address (uint64_t address)
 {
         return address - this->m_load_address;
+}
+
+uint64_t Debugger::offset_dwarf_address (uint64_t address)
+{
+        return address + this->m_load_address;
+}
+
+void Debugger::handle_command ()
+{
+        fprintf (stdout, "(dbg) ");
+
+        std::string command;
+        std::cin >> command;
 }
 
 void Debugger::run ()

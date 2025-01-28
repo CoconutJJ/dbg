@@ -9,6 +9,7 @@ link_directories(${PROJECT_SOURCE_DIR}/lib/libelfin/dwarf ${PROJECT_SOURCE_DIR}/
 
 add_executable(dbg "src/main.cpp")
 
+add_library(debugger SHARED "src/debugger.cpp")
 add_library(breakpoint SHARED "src/breakpoint.cpp")
 
 include_directories(include)

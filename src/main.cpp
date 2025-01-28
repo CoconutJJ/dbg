@@ -28,8 +28,5 @@ int main (int argc, char **argv)
                 }
         }
 
-        
-
         struct user_regs_struct regs;
-
 }
