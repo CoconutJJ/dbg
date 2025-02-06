@@ -3,10 +3,13 @@
 #include "data.hh"
 #include "dwarf++.hh"
 #include "elf++.hh"
+#include <bits/types/struct_iovec.h>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <elf.h>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
@@ -28,8 +31,12 @@ Debugger::Debugger (std::string program_name) : m_program_name (program_name)
                 exit (EXIT_FAILURE);
         }
 
-        m_elf = elf::elf (elf::create_mmap_loader (program_file_fd));
-        m_dwarf = dwarf::dwarf (dwarf::elf::create_loader (m_elf));
+        try {
+                m_elf = elf::elf (elf::create_mmap_loader (program_file_fd));
+                m_dwarf = dwarf::dwarf (dwarf::elf::create_loader (m_elf));
+        } catch (dwarf::format_error &e) {
+                std::cerr << "Missing debug symbols" << e.what ();
+        }
 }
 
 dwarf::die Debugger::get_function_from_pc (uint64_t pc)
@@ -128,16 +135,17 @@ void Debugger::step_over_breakpoint ()
 
         this->unset_breakpoint (bp_loc);
 
-        ptrace (PTRACE_SINGLESTEP, this->m_pid, nullptr, nullptr);
-
-        this->wait_for_signal ();
+        this->single_step_instruction ();
 
         this->set_breakpoint (bp_loc);
 }
 
 void Debugger::single_step_instruction ()
 {
-        ptrace (PTRACE_SINGLESTEP, m_pid, nullptr, nullptr);
+        if (ptrace (PTRACE_SINGLESTEP, m_pid, nullptr, nullptr) < 0) {
+                perror ("ptrace");
+                exit (EXIT_FAILURE);
+        }
         this->wait_for_signal ();
 }
 
@@ -298,7 +306,10 @@ uint64_t Debugger::read_memory (uint64_t address)
 
 void Debugger::write_memory (uint64_t address, uint64_t value)
 {
-        ptrace (PTRACE_POKEDATA, m_pid, address, value);
+        if (ptrace (PTRACE_POKEDATA, m_pid, address, value) < 0) {
+                perror ("ptrace");
+                exit (EXIT_FAILURE);
+        }
 }
 
 uint64_t Debugger::get_pc ()
@@ -322,7 +333,12 @@ uint64_t Debugger::read_register (int reg_no)
 {
         struct user_regs_struct regs;
 
-        ptrace (PTRACE_GETREGSET, this->m_pid, nullptr, &regs);
+        struct iovec io = { .iov_base = &regs, .iov_len = sizeof (struct user_regs_struct) };
+
+        if (ptrace (PTRACE_GETREGSET, this->m_pid, NT_PRSTATUS, &io) < 0) {
+                perror ("ptrace");
+                exit (EXIT_FAILURE);
+        }
 
         if (reg_no == -1)
                 return regs.pc;
@@ -334,7 +350,12 @@ void Debugger::write_register (int reg_no, uint64_t value)
 {
         struct user_regs_struct regs;
 
-        ptrace (PTRACE_GETREGSET, this->m_pid, nullptr, &regs);
+        struct iovec io = { .iov_base = &regs, .iov_len = sizeof (struct user_regs_struct) };
+
+        if (ptrace (PTRACE_GETREGSET, this->m_pid, NT_PRSTATUS, &io) < 0) {
+                perror ("ptrace");
+                exit (EXIT_FAILURE);
+        }
 
         if (reg_no == -1) {
                 regs.pc = value;
@@ -342,7 +363,10 @@ void Debugger::write_register (int reg_no, uint64_t value)
                 regs.regs[reg_no] = value;
         }
 
-        ptrace (PTRACE_SETREGSET, this->m_pid, nullptr, &regs);
+        if (ptrace (PTRACE_SETREGSET, this->m_pid, NT_PRSTATUS, &io) < 0) {
+                perror ("ptrace");
+                exit (EXIT_FAILURE);
+        }
 }
 
 int Debugger::wait_for_signal ()
@@ -364,9 +388,13 @@ bool Debugger::launch_tracee ()
         }
         if (pid > 0) {
                 m_pid = pid;
+                this->wait_for_signal ();
                 return true;
         }
-        ptrace (PTRACE_TRACEME, 0, nullptr, nullptr);
+        if (ptrace (PTRACE_TRACEME, 0, nullptr, nullptr) < 0) {
+                perror ("ptrace");
+                exit (EXIT_FAILURE);
+        }
         personality (ADDR_NO_RANDOMIZE);
         execl (this->m_program_name.c_str (), this->m_program_name.c_str (), nullptr);
         perror ("exec");
@@ -375,7 +403,10 @@ bool Debugger::launch_tracee ()
 
 void Debugger::continue_execution ()
 {
-        ptrace (PTRACE_CONT, this->m_pid, nullptr, nullptr);
+        if (ptrace (PTRACE_CONT, this->m_pid, nullptr, nullptr) < 0) {
+                perror ("ptrace");
+                exit (EXIT_FAILURE);
+        }
         this->wait_for_signal ();
 }
 
@@ -405,10 +436,19 @@ uint64_t Debugger::offset_dwarf_address (uint64_t address)
 
 void Debugger::handle_command ()
 {
-        fprintf (stdout, "(dbg) ");
+        char command_buffer[80];
 
-        std::string command;
-        std::cin >> command;
+        do {
+                fprintf (stdout, "(dbg) ");
+
+                if (strcmp (command_buffer, "stepi\n") == 0) {
+                        this->single_step_instruction_with_breakpoint_check ();
+                }
+                printf ("pc: %lu\n", this->get_pc ());
+                auto line_entry = this->get_line_entry_from_pc (this->get_offset_pc ());
+                this->print_source (line_entry->file->path.c_str (), line_entry->line, 10);
+
+        } while (fgets (command_buffer, 80, stdin) != NULL);
 }
 
 void Debugger::run ()
@@ -417,22 +457,5 @@ void Debugger::run ()
                 exit (EXIT_FAILURE);
         }
 
-        while (1) {
-                int wait_status = this->wait_for_signal ();
-
-                if (WIFSTOPPED (wait_status)) {
-                        fprintf (stderr, "Process received signal %d\n", WSTOPSIG (wait_status));
-                }
-
-                // if (WIFEXITED(wait_status)) {
-                //   int status = WEXITSTATUS(wait_status);
-                //   fprintf(stderr, "Process exited with status code %d\n", status);
-                //   break;
-                // } else if (WIFSIGNALED(wait_status)) {
-                //   fprintf(stderr, "Process received signal %d\n", WTERMSIG(wait_status));
-                // }
-
-                getchar ();
-                ptrace (PTRACE_CONT, this->m_pid, nullptr, nullptr);
-        }
+        this->handle_command ();
 }

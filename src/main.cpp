@@ -1,3 +1,4 @@
+#include "debugger.hpp"
 #include <asm/ptrace.h>
 #include <csignal>
 #include <cstdlib>
@@ -28,5 +29,7 @@ int main (int argc, char **argv)
                 }
         }
 
-        struct user_regs_struct regs;
+        Debugger debugger(debug_program_path);
+
+        debugger.run();
 }
